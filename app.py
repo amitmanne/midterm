@@ -1,3 +1,18 @@
+import streamlit as st                   # Streamlit UI
+import pandas as pd                      # DataFrame handling
+
+st.set_page_config(page_title="Play Store Explorer", layout="wide")  # Nice layout
+
+@st.cache_data(show_spinner=False, ttl=86400)  # Cache for 24h so reloads are instant
+def load_data():
+    return pd.read_csv("data/apps_clean.csv.gz")  # Load local file from repo
+
+with st.spinner("Loading data..."):
+    df = load_data()
+
+st.success(f"Loaded {df.shape[0]:,} rows")
+
+
 # app.py
 # Streamlit app for Google Play analysis (EDA, Simpson's paradox, OLS regressions)
 # All comments and UI text in English, per course standard.
@@ -5,8 +20,6 @@
 import os
 import io
 import numpy as np
-import pandas as pd
-import streamlit as st
 import matplotlib.pyplot as plt
 import seaborn as sns
 import statsmodels.api as sm
