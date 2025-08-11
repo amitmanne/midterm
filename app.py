@@ -1,16 +1,22 @@
-import streamlit as st                   # Streamlit UI
-import pandas as pd                      # DataFrame handling
+import streamlit as st            # Streamlit UI
+import pandas as pd               # DataFrame handling
+from pathlib import Path          # Robust relative paths
 
-st.set_page_config(page_title="Play Store Explorer", layout="wide")  # Nice layout
+# Page config — call ONCE, at the very top
+st.set_page_config(page_title="Play Store Explorer", layout="wide")
 
-@st.cache_data(show_spinner=False, ttl=86400)  # Cache for 24h so reloads are instant
-def load_data():
-    return pd.read_csv("data/apps_clean.csv.gz")  # Load local file from repo
+# Build a robust relative path to the CSV in the repo
+DATA_PATH = Path(__file__).parent / "data" / "apps_clean.csv.gz"
+
+@st.cache_data(show_spinner=False, ttl=86400)  # cache for 24h
+def load_data(path: Path) -> pd.DataFrame:
+    # Explicit options keep memory/encoding stable in the cloud
+    return pd.read_csv(path, low_memory=False)
 
 with st.spinner("Loading data..."):
-    df = load_data()
+    df = load_data(DATA_PATH)
 
-st.success(f"Loaded {df.shape[0]:,} rows")
+st.success(f"Loaded {df.shape[0]:,} rows × {df.shape[1]} columns")
 
 
 # app.py
