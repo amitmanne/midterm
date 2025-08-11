@@ -1,6 +1,6 @@
 # app.py
-# Google Play Explorer — Streamlit
-# Tabs: Overview, Explore (EDA), Simpson, Regression (log-log), Free vs Paid (FE), About
+# Streamlit app for Google Play analysis (EDA, Simpson's paradox, OLS regressions)
+# All UI text in English (per course standard)
 
 from __future__ import annotations
 
@@ -9,450 +9,449 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
-import seaborn as sns
 import matplotlib.pyplot as plt
+import seaborn as sns
 import statsmodels.api as sm
 
-# -----------------------------
-# Page + style
-# -----------------------------
+# -------------------------
+# Page & style
+# -------------------------
 st.set_page_config(page_title="Play Store Explorer", layout="wide")
 sns.set_context("talk", font_scale=0.9)
 sns.set_style("whitegrid")
 
-# -----------------------------
-# Data sources
-# -----------------------------
+# -------------------------
+# Helpers: robust utils
+# -------------------------
 DATA_PATH = Path(__file__).parent / "data" / "apps_clean.csv.gz"
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def _read_csv_bytes(b: bytes) -> pd.DataFrame:
-    return pd.read_csv(io.BytesIO(b), low_memory=False)
+def rotate_xticks(ax, deg: int = 45, ha: str = "right"):
+    """Safe tick rotation + alignment for new Matplotlib versions."""
+    ax.tick_params(axis="x", which="both", labelrotation=deg)
+    plt.setp(ax.get_xticklabels(), ha=ha)
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def _read_csv_path(p: Path) -> pd.DataFrame:
-    return pd.read_csv(p, low_memory=False)
-
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def _read_csv_url(u: str) -> pd.DataFrame:
-    return pd.read_csv(u, low_memory=False)
-
-# -----------------------------
-# Cleaning helpers (robust to raw/clean CSV)
-# -----------------------------
-def _to_num(s):
-    return pd.to_numeric(s, errors="coerce")
-
-def parse_installs(x):
-    # works for raw Kaggle "100,000+" etc. or clean numeric
-    if pd.isna(x):
+def parse_int(s):
+    if pd.isna(s):
         return np.nan
-    if isinstance(x, (int, float)):
-        return float(x)
-    s = str(x).replace(",", "").replace("+", "").strip()
+    s = str(s).strip()
+    s = s.replace(",", "").replace("+", "")
+    if s.isdigit():
+        return int(s)
+    return np.nan
+
+def parse_price(s):
+    if pd.isna(s):
+        return 0.0
+    s = str(s).strip().replace("$", "").replace("₪", "")
     try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+def parse_size_mb(s):
+    if pd.isna(s):
+        return np.nan
+    s = str(s).strip().lower()
+    if "varies" in s:
+        return np.nan
+    try:
+        if s.endswith("m"):
+            return float(s[:-1])
+        if s.endswith("mb"):
+            return float(s[:-2])
+        if s.endswith("k") or s.endswith("kb"):
+            # Convert KB to MB
+            num = s[:-1] if s.endswith("k") else s[:-2]
+            return float(num) / 1024.0
+        # pure number
         return float(s)
     except Exception:
         return np.nan
 
-def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.copy()
+# -------------------------
+# Data loading (cached)
+# -------------------------
+@st.cache_data(show_spinner=False, ttl=86400)  # cache for 24h
+def load_default() -> pd.DataFrame:
+    return pd.read_csv(DATA_PATH, low_memory=False)
 
-    # Category_text
-    if "Category_text" not in d.columns:
-        if "Category" in d.columns:
-            d["Category_text"] = d["Category"].astype(str)
-        elif "category" in d.columns:
-            d["Category_text"] = d["category"].astype(str)
-        else:
-            d["Category_text"] = "Unknown"
+def load_from_upload_or_url() -> pd.DataFrame | None:
+    """Allow the user to upload a CSV or paste a public URL to CSV (Dropbox/GitHub raw)."""
+    left = st.sidebar
+    url = left.text_input("Optional: CSV URL (public)", placeholder="https://...csv")
+    upload = left.file_uploader("Or upload a CSV", type=["csv"])
+    df = None
 
-    # Type_label
-    if "Type_label" not in d.columns:
-        base = d.get("Type", d.get("type", pd.Series(index=d.index, dtype=str))).astype(str)
-        d["Type_label"] = base
+    if upload is not None:
+        try:
+            df = pd.read_csv(upload, low_memory=False)
+        except Exception as e:
+            st.error(f"Could not read uploaded CSV: {e}")
 
-    # Rating_num
-    if "Rating_num" not in d.columns and "Rating" in d.columns:
-        d["Rating_num"] = _to_num(d["Rating"])
-    elif "Rating_num" in d.columns:
-        d["Rating_num"] = _to_num(d["Rating_num"])
+    if df is None and url:
+        try:
+            df = pd.read_csv(url, low_memory=False)
+        except Exception as e:
+            st.error(f"Could not fetch URL: {e}")
 
-    # Reviews
-    if "Reviews" in d.columns:
-        d["Reviews"] = _to_num(d["Reviews"])
-    elif "reviews" in d.columns:
-        d["Reviews"] = _to_num(d["reviews"])
+    return df
 
-    # Installs_num
-    if "Installs_num" not in d.columns:
-        col = "Installs" if "Installs" in d.columns else ("installs" if "installs" in d.columns else None)
-        if col is not None:
-            d["Installs_num"] = d[col].map(parse_installs)
+def clean_df(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """Create robust numeric features used by all views."""
+    df = df_raw.copy()
+
+    # Column name normalization (work with common Kaggle schema variants)
+    cols = {c.lower().strip(): c for c in df.columns}
+    # Required-ish names with fallbacks:
+    col_name   = cols.get("app", cols.get("app name", cols.get("name", None)))
+    col_cat    = cols.get("category", cols.get("categories", None))
+    col_type   = cols.get("type", None)
+    col_price  = cols.get("price", None)
+    col_size   = cols.get("size", None)
+    col_rate   = cols.get("rating", cols.get("ratings", None))
+    col_rev    = cols.get("reviews", None)
+    col_inst   = cols.get("installs", None)
+    col_upd    = cols.get("last updated", cols.get("last_update", None))
+
+    # Create harmonized columns if exist
+    if col_rate and col_rate in df:
+        df["Rating_num"] = pd.to_numeric(df[col_rate], errors="coerce")
     else:
-        d["Installs_num"] = _to_num(d["Installs_num"])
+        df["Rating_num"] = np.nan
 
-    # Size_MB (best-effort)
-    if "Size_MB" in d.columns:
-        d["Size_MB"] = _to_num(d["Size_MB"])
-    elif "Size" in d.columns:
-        # raw may contain 'Varies with device' or '12M'
-        def _size_to_mb(s):
-            if pd.isna(s): return np.nan
-            s = str(s).strip()
-            if "Varies" in s: return np.nan
-            if s.endswith("k") or s.endswith("K"):
-                return float(s[:-1]) / 1024.0
-            if s.endswith("M") or s.endswith("m"):
-                return float(s[:-1])
-            try: return float(s)
-            except: return np.nan
-        d["Size_MB"] = d["Size"].map(_size_to_mb)
+    if col_rev and col_rev in df:
+        df["Reviews_num"] = df[col_rev].apply(parse_int)
+    else:
+        df["Reviews_num"] = np.nan
 
-    # LastUpdated (datetime)
-    if "LastUpdated" in d.columns:
-        d["LastUpdated"] = pd.to_datetime(d["LastUpdated"], errors="coerce")
-    elif "Last Updated" in d.columns:
-        d["LastUpdated"] = pd.to_datetime(d["Last Updated"], errors="coerce")
+    if col_inst and col_inst in df:
+        df["Installs_num"] = df[col_inst].apply(parse_int)
+    else:
+        df["Installs_num"] = np.nan
 
-    # Year for filter
-    if "LastUpdated" in d.columns:
-        d["LastUpdated_year"] = d["LastUpdated"].dt.year
+    if col_type and col_type in df:
+        df["Type_text"] = df[col_type].astype(str)
+    else:
+        df["Type_text"] = np.where(df.get("Price", pd.Series(np.nan)).notna(), "Paid", "Free")
 
-    return d
+    if col_price and col_price in df:
+        df["Price_num"] = df[col_price].apply(parse_price)
+    else:
+        df["Price_num"] = 0.0
 
-# -----------------------------
-# Sidebar: load + filters
-# -----------------------------
-st.sidebar.header("Data")
-csv_url = st.sidebar.text_input("Optional: CSV URL (public)")
-upload = st.sidebar.file_uploader("Or upload a CSV", type=["csv"])
+    if col_cat and col_cat in df:
+        df["Category_text"] = df[col_cat].astype(str).str.replace("_", " ").str.title()
+    else:
+        df["Category_text"] = "Unknown"
 
-with st.spinner("Loading data..."):
-    try:
-        if upload is not None:
-            df_raw = _read_csv_bytes(upload.read())
-        elif csv_url.strip():
-            df_raw = _read_csv_url(csv_url.strip())
-        else:
-            df_raw = _read_csv_path(DATA_PATH)
-    except Exception as e:
-        st.error(f"Failed to load data: {e}")
-        st.stop()
+    if col_size and col_size in df:
+        df["Size_MB"] = df[col_size].apply(parse_size_mb)
+    else:
+        df["Size_MB"] = np.nan
 
-df = normalize_df(df_raw)
+    if col_upd and col_upd in df:
+        df["LastUpdated"] = pd.to_datetime(df[col_upd], errors="coerce")
+    else:
+        df["LastUpdated"] = pd.NaT
+
+    # Additional constructed features
+    df["Is_Paid_num"] = np.where((df["Price_num"] > 0) | (df["Type_text"].str.lower() == "paid"), 1.0, 0.0)
+
+    # Recency in years (relative to the max valid date)
+    if df["LastUpdated"].notna().any():
+        latest = df["LastUpdated"].max()
+        df["Recency_years"] = (latest - df["LastUpdated"]).dt.days / 365.25
+    else:
+        df["Recency_years"] = np.nan
+
+    # Log transforms (safe)
+    df["log10_installs"] = np.log10(np.clip(df["Installs_num"].astype(float), 1, None))
+    df["log10_reviews"] = np.log10(np.clip(df["Reviews_num"].astype(float), 1, None))
+
+    # Keep only rows that have a category, rating in range, and numeric installs/reviews
+    df = df[df["Category_text"].notna()].copy()
+    df = df[(df["Rating_num"].between(1, 5)) | df["Rating_num"].isna()]
+    return df
+
+# -------------------------
+# Load data with fallbacks
+# -------------------------
+user_df = load_from_upload_or_url()
+if user_df is None:
+    with st.spinner("Loading data..."):
+        user_df = load_default()
+
+df = clean_df(user_df)
 st.success(f"Loaded {df.shape[0]:,} rows × {df.shape[1]} columns")
 
-# Filters
-st.sidebar.header("Filters")
-
+# -------------------------
+# Sidebar filters
+# -------------------------
 cats = sorted(df["Category_text"].dropna().unique().tolist())
 sel_cats = st.sidebar.multiselect("Categories", cats, default=[])
+type_choice = st.sidebar.radio("Type", ["All", "Free", "Paid"], horizontal=True)
+min_reviews = int(st.sidebar.number_input("Minimum reviews", value=0, min_value=0, step=100))
+year_min = int((df["LastUpdated"].dt.year.min() if df["LastUpdated"].notna().any() else 2010))
+year_max = int((df["LastUpdated"].dt.year.max() if df["LastUpdated"].notna().any() else 2018))
+yr_range = st.sidebar.slider("Updated year range", min_value=year_min, max_value=year_max,
+                             value=(year_min, year_max))
 
-type_opt = st.sidebar.radio("Type", ["All", "Free", "Paid"], horizontal=True)
-
-max_reviews = int(_to_num(df["Reviews"]).fillna(0).max())
-min_reviews = st.sidebar.slider("Minimum reviews", 0, max(1000, max_reviews), 0, step=100)
-
-if "LastUpdated_year" in df.columns:
-    yr_min, yr_max = int(df["LastUpdated_year"].min()), int(df["LastUpdated_year"].max())
-    yr_rng = st.sidebar.slider("Updated year range", yr_min, yr_max, (yr_min, yr_max))
-else:
-    yr_rng = None
-
-df_f = df.copy()
+flt = df.copy()
 if sel_cats:
-    df_f = df_f[df_f["Category_text"].isin(sel_cats)]
-if type_opt != "All":
-    df_f = df_f[df_f["Type_label"].astype(str).str.contains(type_opt, case=False, na=False)]
-df_f = df_f[_to_num(df_f["Reviews"]).fillna(0) >= min_reviews]
-if yr_rng and "LastUpdated_year" in df_f.columns:
-    df_f = df_f[df_f["LastUpdated_year"].between(yr_rng[0], yr_rng[1])]
+    flt = flt[flt["Category_text"].isin(sel_cats)]
+if type_choice != "All":
+    if type_choice == "Free":
+        flt = flt[flt["Is_Paid_num"] == 0]
+    else:
+        flt = flt[flt["Is_Paid_num"] == 1]
+if min_reviews > 0:
+    flt = flt[flt["Reviews_num"] >= min_reviews]
+if flt["LastUpdated"].notna().any():
+    flt = flt[flt["LastUpdated"].dt.year.between(yr_range[0], yr_range[1])]
 
-st.caption(f"**Active filter →** {len(df_f):,} apps")
+st.caption(f"Active filter ≈ {flt.shape[0]:,} apps")
 
-# -----------------------------
+# -------------------------
 # Tabs
-# -----------------------------
-tab_overview, tab_explore, tab_simpson, tab_reg, tab_fe, tab_about = st.tabs(
-    ["🔎 Overview", "🧭 Explore", "♟️ Simpson", "📈 Regression", "💲 Free vs Paid (FE)", "ℹ️ About"]
+# -------------------------
+tab_over, tab_explore, tab_simp, tab_reg, tab_fe, tab_about = st.tabs(
+    ["Overview", "Explore", "Simpson", "Regression", "Free vs Paid (FE)", "About"]
 )
 
-# -----------------------------
-# Tab: Overview
-# -----------------------------
-with tab_overview:
-    st.write("### Overview")
+# -------------------------
+# Overview
+# -------------------------
+with tab_over:
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Apps", f"{len(df_f):,}")
-    med_rating = _to_num(df_f.get("Rating_num")).median()
-    c2.metric("Median rating", f"{med_rating:.2f}" if not np.isnan(med_rating) else "—")
-    paid_share = df_f["Type_label"].astype(str).str.contains("Paid", case=False, na=False).mean() if len(df_f) else 0.0
-    c3.metric("Paid share", f"{100*paid_share:.1f}%")
-    med_installs = _to_num(df_f.get("Installs_num")).median()
-    c4.metric("Median installs", f"{med_installs:,.0f}" if not np.isnan(med_installs) else "—")
+    c1.metric("Apps", f"{flt.shape[0]:,}")
+    c2.metric("Median rating", f"{flt['Rating_num'].median():.2f}")
+    c3.metric("Paid share", f"{100*flt['Is_Paid_num'].mean():.1f}%")
+    c4.metric("Median installs", f"{flt['Installs_num'].median():,}")
 
-    st.divider()
-    st.write("Sample (first 10):")
-    st.dataframe(df_f.head(10))
+    st.markdown("**Sample (first 10):**")
+    st.dataframe(flt.head(10), use_container_width=True, height=280)
 
-# -----------------------------
-# Tab: Explore (EDA)
-# -----------------------------
+# -------------------------
+# Explore
+# -------------------------
 with tab_explore:
-    st.write("### Quick EDA")
+    st.subheader("Quick EDA")
 
-    col1, col2 = st.columns(2, gap="large")
+    # Rating distribution
+    fig, ax = plt.subplots(figsize=(8, 5))
+    sns.histplot(flt["Rating_num"].dropna(), bins=30, ax=ax)
+    ax.set_xlabel("Rating (1–5)")
+    ax.set_ylabel("Count")
+    st.pyplot(fig, use_container_width=True)
 
-    with col1:
-        if "Rating_num" in df_f.columns:
-            fig, ax = plt.subplots(figsize=(6, 3.2))
-            sns.histplot(_to_num(df_f["Rating_num"]).dropna(), bins=30, ax=ax)
-            ax.set_title("Rating distribution")
-            ax.set_xlabel("Rating (1–5)")
-            st.pyplot(fig)
+    # Top categories by count
+    top = flt["Category_text"].value_counts().head(12).sort_values(ascending=False)
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    sns.barplot(x=top.index, y=top.values, ax=ax)
+    ax.set_xlabel("Category")
+    ax.set_ylabel("Apps")
+    rotate_xticks(ax, 45, "right")
+    st.pyplot(fig, use_container_width=True)
 
-        # Top categories
-        top = df_f["Category_text"].value_counts().head(12).reset_index()
-        top.columns = ["Category", "n"]
-        fig, ax = plt.subplots(figsize=(6, 3.2))
-        sns.barplot(data=top, x="Category", y="n", ax=ax)
-        ax.set_title("Top categories (by count)")
-        ax.set_xlabel("Category")
-        ax.set_ylabel("Apps")
-        ax.tick_params(axis="x", rotation=45, ha="right")
-        st.pyplot(fig)
+    # Scatter (log-log) Installs vs Reviews
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.scatter(flt["log10_reviews"], flt["log10_installs"], alpha=0.15, s=10)
+    ax.set_xlabel("log10(Reviews)")
+    ax.set_ylabel("log10(Installs)")
+    st.pyplot(fig, use_container_width=True)
 
-    with col2:
-        # Scatter log-log Installs vs Reviews (sample for speed)
-        d = df_f[["Installs_num", "Reviews"]].copy()
-        d["Installs_num"] = _to_num(d["Installs_num"])
-        d["Reviews"] = _to_num(d["Reviews"])
-        d = d.dropna()
-        d = d[(d["Installs_num"] > 0) & (d["Reviews"] > 0)]
-        if len(d) > 0:
-            n_show = min(8000, len(d))
-            d = d.sample(n_show, random_state=42) if len(d) > n_show else d
-            d["logI"] = np.log10(d["Installs_num"])
-            d["logR"] = np.log10(d["Reviews"])
-            fig, ax = plt.subplots(figsize=(6.5, 3.5))
-            ax.scatter(d["logR"], d["logI"], s=10, alpha=0.25)
-            ax.set_xlabel("log10(Reviews)")
-            ax.set_ylabel("log10(Installs)")
-            ax.set_title("Installs vs Reviews (log–log)")
-            st.pyplot(fig)
+# -------------------------
+# Simpson’s paradox demo
+# -------------------------
+with tab_simp:
+    st.subheader("Weighted vs unweighted means (Simpson-like reversal)")
 
-# -----------------------------
-# Tab: Simpson
-# -----------------------------
-with tab_simpson:
-    st.write("### Simpson-like reversal (weighted vs unweighted means)")
+    # pick a category to compare with overall
+    cat_pick = st.selectbox("Pick a category", cats, index=(cats.index("Events") if "Events" in cats else 0))
 
-    cats_all = sorted(df["Category_text"].dropna().unique().tolist())
-    defaults = [c for c in ["Events", "Medical"] if c in cats_all][:2]
-    pair = st.multiselect("Pick two categories", cats_all, default=defaults, max_selections=2)
+    sub = flt.copy()
+    sub_cat = sub[sub["Category_text"] == cat_pick].copy()
 
-    if len(pair) != 2:
-        st.info("Pick exactly two categories.")
-    else:
-        a, b = pair
-        sub = df[df["Category_text"].isin([a, b])].dropna(subset=["Rating_num", "Reviews"]).copy()
-        if sub.empty:
-            st.warning("No data for the selected categories.")
-        else:
-            unweighted = sub.groupby("Category_text")["Rating_num"].mean()
-            wmean = sub.groupby("Category_text").apply(
-                lambda g: (_to_num(g["Rating_num"]) * _to_num(g["Reviews"])).sum() / _to_num(g["Reviews"]).sum()
-            )
+    def wavg(series, weights):
+        w = np.clip(weights.fillna(0).astype(float), 0.0, None)
+        x = series.astype(float)
+        if w.sum() <= 0:
+            return np.nan
+        return np.average(x, weights=w)
 
-            plotdf = pd.DataFrame({
-                "Category": [a, a, b, b],
-                "Mean type": ["Unweighted", "Weighted", "Unweighted", "Weighted"],
-                "Rating": [unweighted.get(a, np.nan), wmean.get(a, np.nan),
-                           unweighted.get(b, np.nan), wmean.get(b, np.nan)],
-            })
+    overall_unw = sub["Rating_num"].mean()
+    overall_w   = wavg(sub["Rating_num"], sub["Reviews_num"])
+    cat_unw     = sub_cat["Rating_num"].mean()
+    cat_w       = wavg(sub_cat["Rating_num"], sub_cat["Reviews_num"])
 
-            colors = {"Unweighted": "#4C78A8", "Weighted": "#F58518"}
-            fig, ax = plt.subplots(figsize=(6.6, 3.6))
-            for mt in ["Unweighted", "Weighted"]:
-                dd = plotdf[plotdf["Mean type"] == mt]
-                ax.bar(dd["Category"], dd["Rating"], width=0.4, label=mt, color=colors[mt])
-                for x, v in zip(dd["Category"], dd["Rating"]):
-                    ax.text(x, v + 0.01, f"{v:.2f}", ha="center", va="bottom", fontsize=9)
-            ax.set_ylim(3.8, 4.7)
-            ax.set_ylabel("Average rating")
-            ax.set_title(f"Overall vs Category — {a} & {b}")
-            ax.legend(title="Mean type")
-            st.pyplot(fig)
+    plot_df = pd.DataFrame({
+        "Group": ["Overall (Unweighted)", "Overall (Weighted)",
+                  f"{cat_pick} (Unweighted)", f"{cat_pick} (Weighted)"],
+        "Mean":  [overall_unw, overall_w, cat_unw, cat_w]
+    })
 
-            st.markdown(
-                """
-**What I show:** Two bars per category – *unweighted* mean and *weighted-by-reviews* mean.  
-**Why it matters:** Small groups with high raw averages can lose to large groups once we weight by reliability (review counts).  
-**Takeaway for PMs:** Always check weighted metrics and consider fixed effects (category) before prioritizing “top-rated” items.
-                """
-            )
+    fig, ax = plt.subplots(figsize=(8, 4.6))
+    sns.barplot(data=plot_df, x="Group", y="Mean", ax=ax, palette=["#4C78A8", "#F58518", "#54A24B", "#B279A2"])
+    ax.set_ylabel("Average rating")
+    ax.set_xlabel("")
+    rotate_xticks(ax, 20, "right")
+    for p in ax.patches:
+        y = p.get_height()
+        ax.text(p.get_x() + p.get_width()/2, y + 0.02, f"{y:.2f}", ha="center", va="bottom", fontsize=10)
+    ax.set_ylim(3.6, 4.7)
+    st.pyplot(fig, use_container_width=True)
 
-# -----------------------------
-# Tab: Regression (log–log)
-# -----------------------------
-with tab_reg:
-    st.write("### OLS regression: log10(Installs) ~ log10(Reviews)")
-    dat = df_f[["Installs_num", "Reviews"]].copy()
-    dat["Installs_num"] = _to_num(dat["Installs_num"])
-    dat["Reviews"] = _to_num(dat["Reviews"])
-    dat = dat.dropna()
-    dat = dat[(dat["Installs_num"] > 0) & (dat["Reviews"] > 0)]
-    if dat.empty:
-        st.warning("No data after filters.")
-    else:
-        dat["log10_installs"] = np.log10(dat["Installs_num"])
-        dat["log10_reviews"] = np.log10(dat["Reviews"])
-
-        X = sm.add_constant(dat["log10_reviews"])
-        m = sm.OLS(dat["log10_installs"], X).fit(cov_type="HC1")
-
-        # Coef table
-        ci = pd.DataFrame(m.conf_int(alpha=0.05), columns=["ci_low", "ci_high"])
-        coef_tbl = pd.DataFrame({"coef": m.params, "std_err": m.bse, "p_value": m.pvalues}).join(ci)
-
-        st.code(f"n = {len(dat):,}\nR-squared (robust se): {m.rsquared:.3f}")
-        st.dataframe(coef_tbl.style.format({"coef":"{:.6f}","std_err":"{:.6f}","ci_low":"{:.6f}","ci_high":"{:.6f}","p_value":"{:.2e}"}))
-
-        # Prediction grid + bands
-        grid = np.linspace(dat["log10_reviews"].min(), dat["log10_reviews"].max(), 120)
-        pred = m.get_prediction(sm.add_constant(grid)).summary_frame(alpha=0.05)
-
-        # light jitter for points so they don't band visually
-        rng = np.random.default_rng(42)
-        xj = dat["log10_reviews"] + rng.normal(0, 0.01, size=len(dat))
-
-        fig, ax = plt.subplots(figsize=(8, 4.8))
-        ax.scatter(xj, dat["log10_installs"], s=10, alpha=0.25, label=f"Apps (n={len(dat):,})")
-        ax.fill_between(grid, pred["obs_ci_lower"], pred["obs_ci_upper"], alpha=0.12, label="95% prediction interval")
-        ax.fill_between(grid, pred["mean_ci_lower"], pred["mean_ci_upper"], alpha=0.20, label="95% CI (mean)")
-        ax.plot(grid, pred["mean"], lw=2.2, label="OLS fit")
-        ax.set_xlabel("log10(Reviews)")
-        ax.set_ylabel("log10(Installs)")
-        ax.set_title("Installs vs Reviews — OLS (log10–log10) with 95% CI & prediction band")
-
-        beta = m.params.get("log10_reviews", np.nan)
-        ax.text(0.98, 0.18,
-                f"$R^2$ = {m.rsquared:.3f}\n"
-                f"Slope (elasticity) = {beta:.3f}\n"
-                "Interpretation: +1% reviews ≈ +1.0% installs.",
-                ha="right", va="bottom", transform=ax.transAxes, fontsize=10)
-        ax.legend(loc="lower right")
-        st.pyplot(fig)
-
-# -----------------------------
-# Tab: Free vs Paid (FE with controls)
-# -----------------------------
-with tab_fe:
-    st.write("### Free vs Paid — OLS with controls and Category Fixed Effects")
-    need = ["Installs_num", "Rating_num", "Size_MB", "Type_label", "Category_text"]
-    if "LastUpdated" in df_f.columns:
-        need += ["LastUpdated"]
-    if not all(c in df.columns for c in need):
-        st.warning("Required columns missing for FE model.")
-    else:
-        d = df_f[need].copy()
-        d["Installs_num"] = _to_num(d["Installs_num"])
-        d["Rating_num"]   = _to_num(d["Rating_num"])
-        d["Size_MB"]      = _to_num(d["Size_MB"])
-        d["Is_Paid_num"]  = d["Type_label"].astype(str).str.contains("Paid", case=False, na=False).astype(float)
-
-        if "LastUpdated" in d.columns:
-            d["Recency_years"] = (pd.Timestamp.today() - pd.to_datetime(d["LastUpdated"], errors="coerce")).dt.days / 365.25
-        else:
-            d["Recency_years"] = np.nan
-
-        d = d.dropna(subset=["Installs_num","Rating_num","Size_MB","Is_Paid_num"])
-        d = d[d["Installs_num"] > 0]
-        if len(d) < 100:
-            st.warning("Not enough rows for FE model after filters.")
-        else:
-            d["log10_installs"] = np.log10(d["Installs_num"])
-            # Base covariates
-            X_base = d[["Is_Paid_num","Rating_num","Size_MB","Recency_years"]].fillna(0.0)
-            # Category fixed effects via dummies
-            X_cat  = pd.get_dummies(d["Category_text"], prefix="cat", drop_first=True)
-            X      = pd.concat([X_base, X_cat], axis=1)
-            X      = sm.add_constant(X)
-            y      = d["log10_installs"]
-
-            fe = sm.OLS(y, X).fit(cov_type="HC1")
-
-            # Coef table (main effects only for clarity)
-            main = ["Is_Paid_num","Rating_num","Size_MB","Recency_years"]
-            ci = pd.DataFrame(fe.conf_int(alpha=0.05), columns=["ci_low","ci_high"])
-            coef_tbl = pd.DataFrame({"coef": fe.params, "std_err": fe.bse, "p_value": fe.pvalues}).join(ci)
-            st.code(f"n = {len(d):,}\nR-squared (robust se): {fe.rsquared:.3f}")
-            st.dataframe(coef_tbl.loc[["const"]+main].style.format(
-                {"coef":"{:.6f}","std_err":"{:.6f}","ci_low":"{:.6f}","ci_high":"{:.6f}","p_value":"{:.2e}"}))
-
-            # Predicted means for Free vs Paid at the *average covariates* (delta method CI)
-            cov = fe.cov_params()
-            xbar = X.mean(axis=0)
-            # Free
-            v_free = xbar.copy()
-            v_free["Is_Paid_num"] = 0.0
-            mu_free = float(np.dot(v_free, fe.params))
-            se_free = float(np.sqrt(np.dot(v_free @ cov, v_free)))
-            # Paid
-            v_paid = xbar.copy()
-            v_paid["Is_Paid_num"] = 1.0
-            mu_paid = float(np.dot(v_paid, fe.params))
-            se_paid = float(np.sqrt(np.dot(v_paid @ cov, v_paid)))
-
-            z = 1.96
-            means = pd.DataFrame({
-                "group": ["Free","Paid"],
-                "mean":  [mu_free, mu_paid],
-                "lo":    [mu_free - z*se_free, mu_paid - z*se_paid],
-                "hi":    [mu_free + z*se_free, mu_paid + z*se_paid],
-            })
-
-            fig, ax = plt.subplots(figsize=(6.2, 4.2))
-            xpos = np.arange(2)
-            ax.errorbar(xpos, means["mean"], yerr=[means["mean"]-means["lo"], means["hi"]-means["mean"]],
-                        fmt="o", capsize=5, lw=2, label="95% CI (mean)")
-            ax.set_xticks(xpos, means["group"])
-            ax.set_ylabel("Expected log10(installs)")
-            ax.set_title("Expected log10(Installs): Free vs Paid (95% CI), with controls")
-            st.pyplot(fig)
-
-            # Quick interpretation line
-            coef_paid = fe.params.get("Is_Paid_num", np.nan)
-            ci_paid   = coef_tbl.loc["Is_Paid_num", ["ci_low","ci_high"]].values
-            st.caption(
-                f"Paid coefficient = {coef_paid:.3f} (95% CI {ci_paid[0]:.3f}, {ci_paid[1]:.3f}). "
-                "Negative implies a penalty vs Free, after controlling for rating, size, recency, and category FE."
-            )
-
-# -----------------------------
-# Tab: About
-# -----------------------------
-with tab_about:
-    st.write("### About this app")
     st.markdown(
-        """
-**What’s inside**
-
-- **Sidebar filters:** Category, Free/Paid, minimum reviews, and (when available) updated-year range.  
-- **Overview:** quick KPIs and sample rows.  
-- **Explore:** rating distribution, top categories, and log–log scatter of installs vs reviews.  
-- **Simpson:** shows how weighting by review counts can flip the ordering between categories.  
-- **Regression:** OLS of log10(installs) on log10(reviews) with a 95% confidence band and prediction interval.  
-- **Free vs Paid (FE):** OLS with controls (rating, size, recency) and **category fixed effects**, with 95% CIs.
-
-**Notes**
-
-- The app accepts either your own CSV (upload/URL) or the repository file `data/apps_clean.csv.gz`.  
-- Caching keeps first load under ~2 minutes; later runs are instant.  
-- Regressions run on the **filtered subset**.
-        """
+        "What we show: two means (unweighted vs weighted-by-reviews) for *Overall* and for the chosen category. "
+        "Sometimes the ordering flips when we weight by volume — a classic Simpson-like effect."
     )
 
-st.markdown("---")
-st.caption("Tip: if the dataset is huge, use filters or turn to a smaller sample in the Explore tab for faster plotting.")
+# -------------------------
+# Regression (log–log): Installs ~ Reviews
+# -------------------------
+with tab_reg:
+    st.subheader("Installs vs Reviews — OLS (log10–log10) with 95% CI & prediction band")
+
+    reg = flt.dropna(subset=["log10_installs", "log10_reviews"]).copy()
+    if reg.shape[0] < 50:
+        st.info("Not enough data after filters for a stable regression.")
+    else:
+        X = sm.add_constant(reg["log10_reviews"].values)
+        y = reg["log10_installs"].values
+        model = sm.OLS(y, X).fit(cov_type="HC1")
+
+        # Grid for predictions
+        xg = np.linspace(reg["log10_reviews"].quantile(0.02), reg["log10_reviews"].quantile(0.98), 100)
+        Xg = sm.add_constant(xg)
+        pred = model.get_prediction(Xg)
+        frame = pred.summary_frame(alpha=0.05)  # mean_ci_lower/upper & obs_ci_lower/upper
+
+        fig, ax = plt.subplots(figsize=(8, 5.5))
+        ax.scatter(reg["log10_reviews"], reg["log10_installs"], alpha=0.12, s=10, label="Apps")
+        ax.plot(xg, frame["mean"], lw=2, label="OLS fit")
+        ax.fill_between(xg, frame["mean_ci_lower"], frame["mean_ci_upper"], alpha=0.25, label="95% CI (mean)")
+        ax.fill_between(xg, frame["obs_ci_lower"], frame["obs_ci_upper"], alpha=0.12, label="95% prediction interval")
+        ax.set_xlabel("log10(Reviews)  • +1 tick = ×10 reviews")
+        ax.set_ylabel("log10(Installs) • +1 tick = ×10 installs")
+        ax.legend(loc="lower right")
+        st.pyplot(fig, use_container_width=True)
+
+        beta = model.params[1]
+        ci_lo, ci_hi = model.conf_int(alpha=0.05)[1]
+        st.caption(
+            f"Model quality: n = {reg.shape[0]:,},  R² (robust se) = {model.rsquared:.3f}  \n"
+            f"Slope (elasticity) = {beta:.3f} (95% CI: {ci_lo:.3f}, {ci_hi:.3f}). "
+            f"Interpretation: +1% reviews ≈ +{(10**beta - 1)*100:.1f}% installs (on average)."
+        )
+
+# -------------------------
+# Free vs Paid — OLS with Category FE
+# -------------------------
+with tab_fe:
+    st.subheader("Free vs Paid — OLS with Category dummies (robust SE)")
+
+    # Build modeling frame (drop rows missing core predictors)
+    fe = flt.dropna(subset=["Rating_num", "log10_installs"]).copy()
+    if fe.shape[0] < 200:
+        st.info("Not enough data after filters for a stable FE regression.")
+    else:
+        # Feature set
+        main_cols = ["Is_Paid_num", "Rating_num"]
+        if "Size_MB" in fe.columns:
+            main_cols.append("Size_MB")
+        if "Recency_years" in fe.columns:
+            main_cols.append("Recency_years")
+
+        X_base = fe[main_cols].astype(float)
+        # Category FE
+        dums = pd.get_dummies(fe["Category_text"], prefix="cat", drop_first=True)
+        X = pd.concat([X_base, dums], axis=1)
+        X = sm.add_constant(X)
+        y = fe["log10_installs"].astype(float).values
+
+        model = sm.OLS(y, X).fit(cov_type="HC1")
+
+        # Coeff table (main effects only)
+        keep = ["const", "Is_Paid_num", "Rating_num", "Size_MB", "Recency_years"]
+        keep = [k for k in keep if k in model.params.index]
+        ci = model.conf_int().loc[keep]
+        coef_tbl = pd.DataFrame({
+            "coef": model.params.loc[keep],
+            "std_err": model.bse.loc[keep],
+            "ci_low": ci[0],
+            "ci_high": ci[1],
+            "p_value": model.pvalues.loc[keep]
+        })
+        st.dataframe(coef_tbl.style.format(precision=6), use_container_width=True)
+
+        # Interpret paid effect on original scale (approx, log10 → multiplier)
+        if "Is_Paid_num" in model.params.index:
+            paid_beta = model.params["Is_Paid_num"]
+            paid_ci = model.conf_int().loc["Is_Paid_num"]
+            mult = 10**paid_beta
+            mult_lo, mult_hi = 10**paid_ci[0], 10**paid_ci[1]
+            st.caption(
+                f"Interpretation: being Paid multiplies installs by ≈ **{mult:.2f}×** "
+                f"(95% CI: {mult_lo:.2f}–{mult_hi:.2f}). Values < 1 imply a penalty vs Free."
+            )
+
+        # 2-point plot (expected log10(installs): Free vs Paid), others at their means (baseline category)
+        means = X.drop(columns=[c for c in X.columns if c.startswith("cat_")]).mean()
+        for is_paid in [0.0, 1.0]:
+            means[f"Is_Paid_num"] = is_paid
+            if "const" not in means.index:  # safety
+                means = pd.concat([pd.Series({"const": 1.0}), means])
+            if "const" in X.columns and means.get("const", 0) != 1.0:
+                means["const"] = 1.0
+
+        def yhat_and_ci(row: pd.Series):
+            exog = row.reindex(model.params.index).fillna(0.0).values.reshape(1, -1)
+            pr = model.get_prediction(exog=exog)
+            sf = pr.summary_frame(alpha=0.05)
+            return float(sf["mean"]), float(sf["mean_ci_lower"]), float(sf["mean_ci_upper"])
+
+        row_free = X.drop(columns=[c for c in X.columns if c.startswith("cat_")]).mean()
+        row_paid = row_free.copy()
+        row_free["Is_Paid_num"] = 0.0
+        row_paid["Is_Paid_num"] = 1.0
+        for nm in ["const"]:
+            if nm in model.params.index and nm not in row_free.index:
+                row_free.loc[nm] = 1.0
+                row_paid.loc[nm] = 1.0
+
+        y0, lo0, hi0 = yhat_and_ci(row_free)
+        y1, lo1, hi1 = yhat_and_ci(row_paid)
+
+        fig, ax = plt.subplots(figsize=(5.5, 4.8))
+        xs = ["Free", "Paid"]
+        ys = [y0, y1]
+        los = [lo0, lo1]
+        his = [hi0, hi1]
+        ax.errorbar(xs, ys, yerr=[np.array(ys) - np.array(los), np.array(his) - np.array(ys)],
+                    fmt="o", capsize=6, lw=2)
+        ax.set_ylabel("Expected log10(installs)")
+        ax.set_title("Expected log10(installs): Free vs Paid (95% CI), controls at mean")
+        st.pyplot(fig, use_container_width=True)
+
+# -------------------------
+# About
+# -------------------------
+with tab_about:
+    st.markdown(
+        """
+        ### About this app
+        - **Overview**: headline KPIs and a sample.
+        - **Explore**: basic EDA (distribution, top categories, scatter).
+        - **Simpson**: compare unweighted vs weighted rating means; a reversal can emerge.
+        - **Regression**: log–log OLS of Installs ~ Reviews with 95% CI & prediction interval.
+        - **Free vs Paid (FE)**: OLS with Category fixed effects and robust SE; shows paid effect size.
+        
+        **Data loading**  
+        - You can upload your CSV or paste a public CSV URL (Dropbox/GitHub raw).  
+        - If none provided, the app uses `data/apps_clean.csv.gz` from the repo.
+
+        **Notes**  
+        - New Matplotlib versions changed `tick_params` behavior; we rotate ticks safely via a helper.
+        - All regressions use robust (HC1) standard errors.
+        """
+    )
