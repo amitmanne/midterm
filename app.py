@@ -252,7 +252,10 @@ with tab_simpson:
             labels = ["Overall (Unweighted)", "Overall (Weighted)", f"{top_cat} (Unweighted)", f"{top_cat} (Weighted)"]
             vals = [overall_unw, overall_w, cu, cw]
             fig, ax = plt.subplots(figsize=(8, 4))
-            ax.bar(range(len(vals)), vals)
+            overall_color = "#1f77b4"  # כחול לכלליים
+            cat_color     = "#ff7f0e"  # כתום לקטגוריה
+            colors = [overall_color, overall_color, cat_color, cat_color]
+            ax.bar(range(len(vals)), vals, color=colors)
             ax.set_xticks(range(len(vals)))
             ax.set_xticklabels(labels, rotation=30, ha="right")
             ax.set_ylabel("Average rating")
@@ -344,7 +347,7 @@ with tab_fe:
         y1 = fe_model.predict(X1).median()
 
         fig, ax = plt.subplots(figsize=(6, 4))
-        ax.bar(["Free", "Paid"], [y0, y1])
+        ax.bar(["Free", "Paid"], [y0, y1], color=["#1f77b4", "#ff7f0e"])
         for i, v in enumerate([y0, y1]):
             ax.text(i, v + 0.01, f"{v:.2f}", ha="center", va="bottom")
         ax.set_ylabel("Expected log10(Installs)")
